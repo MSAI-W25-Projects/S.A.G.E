@@ -1,5 +1,5 @@
 import tkinter as tk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageEnhance
 import cv2
 import torch
 from torchvision import transforms, models
@@ -8,6 +8,8 @@ import random
 import time
 import math
 import pygame
+from deepface import DeepFace
+from collections import deque, Counter
 
 # -------------------------------
 # CONFIGURATION
@@ -17,9 +19,16 @@ GENDER_LIST = ["Male", "Female"]
 BUCKET_MIDPOINTS = np.array([5, 15.5, 25.5, 35.5, 45.5, 55])
 DIST_THRESH = 50
 MAX_MISSING = 5
-ALPHA_EMA = 0.3
+ALPHA_EMA = 0.1
 T_AGE = 1.5
 T_GENDER = 1.5
+
+def detect_emotion(face_np):
+    try:
+        result = DeepFace.analyze(face_np, actions=['emotion'], enforce_detection=False)
+        return result[0]['dominant_emotion']
+    except Exception as e:
+        return "Unknown"
 
 # -------------------------------
 # DEVICE & MODEL SETUP
@@ -42,17 +51,17 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-AGE_AUGS = [lambda x: x, lambda x: x.transpose(Image.FLIP_LEFT_RIGHT)]
+def brightness_aug(img): return ImageEnhance.Brightness(img).enhance(1.2)
+def contrast_aug(img): return ImageEnhance.Contrast(img).enhance(0.9)
+AGE_AUGS = [lambda x: x, lambda x: x.transpose(Image.FLIP_LEFT_RIGHT), brightness_aug, contrast_aug]
 GENDER_AUGS = AGE_AUGS
+
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-# -------------------------------
-# HELPER FUNCTIONS
-# -------------------------------
 def adjust_gamma(image):
-    mean = np.mean(image)/255.0
+    mean = np.mean(image) / 255.0
     gamma = np.log(0.5) / np.log(mean + 1e-6)
-    table = np.array([((i/255.0)**(1.0/gamma))*255 for i in range(256)]).astype("uint8")
+    table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)]).astype("uint8")
     return cv2.LUT(image, table)
 
 def tta_predict(model, pil_img, transform, aug_fns, temp):
@@ -64,10 +73,6 @@ def tta_predict(model, pil_img, transform, aug_fns, temp):
             logits.append(model(input_tensor).squeeze(0))
     avg = torch.stack(logits).mean(0) / temp
     return torch.nn.functional.softmax(avg, dim=0).cpu().numpy()
-
-# -------------------------------
-# PARTICLE FUNCTIONS
-# -------------------------------
 
 class ParticleMixin:
     def create_particles(self, count):
@@ -90,13 +95,8 @@ class ParticleMixin:
             self.particles[i] = (p, dx, dy)
         self.root.after(50, self.animate_particles)
 
-# -------------------------------
     def animate_prediction_glow(self):
-        if hasattr(self, 'current_gender_color'):
-            base_color = self.current_gender_color
-        else:
-            base_color = "00ffee"
-
+        base_color = getattr(self, 'current_gender_color', "00ffee")
         color = f"#{base_color}{int(self.glow_alpha):02x}"
         try:
             self.canvas.itemconfig(self.prediction_label, fill=color)
@@ -111,12 +111,6 @@ class ParticleMixin:
             self.glow_increasing = True
         self.root.after(60, self.animate_prediction_glow)
 
-# -------------------------------
-    def scroll_background(self):
-        self.bg_scroll_offset = (self.bg_scroll_offset + 1) % 960
-        self.canvas.configure(scrollregion=(self.bg_scroll_offset, 0, self.bg_scroll_offset + 960, 720))
-        self.root.after(100, self.scroll_background)
-
     def animate_energy_ring(self):
         if hasattr(self, 'ring_arc'):
             self.canvas.delete(self.ring_arc)
@@ -124,9 +118,6 @@ class ParticleMixin:
         self.ring_arc = self.canvas.create_arc(330, 60, 630, 360, start=angle, extent=90, outline="#00ffee", style="arc", width=4)
         self.root.after(100, self.animate_energy_ring)
 
-# -------------------------------
-# SAGE UI CLASS
-# -------------------------------
 class SageUI(ParticleMixin):
     def __init__(self, root):
         self.root = root
@@ -139,25 +130,19 @@ class SageUI(ParticleMixin):
         pygame.mixer.music.play(-1)
         self.cap = cv2.VideoCapture(0)
 
-        self.bg_scroll_offset = 0
         self.canvas = tk.Canvas(self.root, width=960, height=960, bg="black", highlightthickness=0)
         self.canvas.pack()
 
-        self.header = self.canvas.create_text(480, 30, text="🧙‍♂️ Ask the SAGE",
-                                              font=("Papyrus", 28, "bold"), fill="#00ffee")
-
-        sage_img = Image.open("assets/sage-focus.png")
-        sage_img = sage_img.resize((300, 300))
-        sage_img = Image.open("assets/sage-focus.png")
-        sage_img = sage_img.resize((300, 300))
+        self.header = self.canvas.create_text(480, 30, text="🧙‍♂️ Ask the SAGE", font=("Papyrus", 28, "bold"), fill="#00ffee")
+        sage_img = Image.open("assets/sage-focus.png").resize((300, 300))
         self.sage_photo = ImageTk.PhotoImage(sage_img)
 
         self.glow = self.canvas.create_oval(330, 60, 630, 360, fill="#00ffee", outline="", stipple="gray25")
         self.sage_image_item = self.canvas.create_image(480, 210, image=self.sage_photo)
         self.animate_energy_ring()
 
-        self.video_panel = tk.Label(self.canvas, bd=0, bg="black")
-        self.video_window = self.canvas.create_window(480, 660, window=self.video_panel, width=720, height=400)
+        self.video_panel = tk.Label(self.root, bd=0, bg="black")
+        self.video_panel.place(relx=0.5, rely=0.72, anchor='center', width=720, height=360)
 
         self.trackers = {}
         self.next_face_id = 0
@@ -169,15 +154,21 @@ class SageUI(ParticleMixin):
         self.gender_label_bg = self.canvas.create_rectangle(180, 405, 780, 435, fill="#222222", outline="", stipple="gray25")
         self.age_label = self.canvas.create_text(480, 385, text="", font=("Helvetica", 18, "bold"), fill="#00ffee")
         self.gender_label = self.canvas.create_text(480, 420, text="", font=("Helvetica", 18, "bold"), fill="#ff66cc")
+        self.emotion_label_bg = self.canvas.create_rectangle(180, 440, 780, 470, fill="#222222", outline="", stipple="gray25")
+        self.emotion_label = self.canvas.create_text(480, 455, text="", font=("Helvetica", 18, "bold"), fill="#ffa500")
         self.glow_alpha = 0
         self.glow_increasing = True
-        self.scroll_background()
         self.animate_prediction_glow()
         self.update_frame()
 
     def update_frame(self):
+        if hasattr(self, 'last_process_time') and time.time() - self.last_process_time < 0.1:
+            self.root.after(10, self.update_frame)
+            return
+        self.last_process_time = time.time()
+
         ret, frame = self.cap.read()
-        if not ret:
+        if not ret or frame is None:
             self.root.after(100, self.update_frame)
             return
 
@@ -188,56 +179,62 @@ class SageUI(ParticleMixin):
         frame_proc = adjust_gamma(frame)
         gray = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-        
         seen_ids = set()
 
         for (x, y, w, h) in faces:
-            cx, cy = x + w//2, y + h//2
+            cx, cy = x + w // 2, y + h // 2
             best_id, best_dist = None, float('inf')
             for fid, tr in self.trackers.items():
                 d = math.hypot(cx - tr['centroid'][0], cy - tr['centroid'][1])
                 if d < best_dist and d < DIST_THRESH:
                     best_id, best_dist = fid, d
 
-            if best_id is None:
-                fid = self.next_face_id
+            fid = best_id if best_id is not None else self.next_face_id
+            if fid == self.next_face_id:
                 self.next_face_id += 1
                 self.trackers[fid] = {'centroid': (cx, cy), 'missing': 0, 'ema_age': None, 'ema_gender': None}
-            else:
-                fid = best_id
-                self.trackers[fid]['centroid'] = (cx, cy)
-                self.trackers[fid]['missing'] = 0
+
+            self.trackers[fid]['centroid'] = (cx, cy)
+            self.trackers[fid]['missing'] = 0
             seen_ids.add(fid)
 
-            face = frame_proc[y:y+h, x:x+w]
+            face = frame_proc[y:y + h, x:x + w]
             pil_face = Image.fromarray(cv2.cvtColor(face, cv2.COLOR_BGR2RGB))
-
             age_probs = tta_predict(age_model, pil_face, transform, AGE_AUGS, T_AGE)
-            self.trackers[fid]['ema_age'] = age_probs if self.trackers[fid]['ema_age'] is None else (
-                ALPHA_EMA * age_probs + (1 - ALPHA_EMA) * self.trackers[fid]['ema_age'])
-            age_idx = self.trackers[fid]['ema_age'].argmax()
-            age_str = AGE_RANGES[age_idx]
-            cont_age = (self.trackers[fid]['ema_age'] * BUCKET_MIDPOINTS).sum()
-            age_conf = age_probs[age_idx] * 100
-            age_label = f"{age_str}  — {age_conf:.1f}%"
+            age_idx = age_probs.argmax()
+
+            if 'age_history' not in self.trackers[fid]:
+                self.trackers[fid]['age_history'] = deque(maxlen=10)
+                self.trackers[fid]['cont_age'] = None
+
+            if age_probs[age_idx] >= 0.5:
+                self.trackers[fid]['ema_age'] = age_probs if self.trackers[fid]['ema_age'] is None else (
+                    ALPHA_EMA * age_probs + (1 - ALPHA_EMA) * self.trackers[fid]['ema_age'])
+                self.trackers[fid]['age_history'].append(age_idx)
+                cont_age = (self.trackers[fid]['ema_age'] * BUCKET_MIDPOINTS).sum()
+                self.trackers[fid]['cont_age'] = cont_age if self.trackers[fid]['cont_age'] is None else (
+                    ALPHA_EMA * cont_age + (1 - ALPHA_EMA) * self.trackers[fid]['cont_age'])
+            else:
+                continue
+                self.trackers[fid]['cont_age'] = cont_age if self.trackers[fid]['cont_age'] is None else (
+                    ALPHA_EMA * cont_age + (1 - ALPHA_EMA) * self.trackers[fid]['cont_age'])
 
             gender_probs = tta_predict(gender_model, pil_face, transform, GENDER_AUGS, T_GENDER)
-            self.trackers[fid]['ema_gender'] = gender_probs if self.trackers[fid]['ema_gender'] is None else (
-                ALPHA_EMA * gender_probs + (1 - ALPHA_EMA) * self.trackers[fid]['ema_gender'])
-            gender_idx = self.trackers[fid]['ema_gender'].argmax()
+            gender_idx = gender_probs.argmax()
             gender_conf = gender_probs[gender_idx] * 100
             gender_str = f"{GENDER_LIST[gender_idx]} — {gender_conf:.1f}%"
+            self.current_gender_color = "0099ff" if gender_idx == 0 else "ff66cc"
 
-            icon = "♂" if gender_str == "Male" else "♀"
-            label = f"{icon} {gender_str}   {age_label}"
+            age_mode = Counter(self.trackers[fid]['age_history']).most_common(1)[0][0] if self.trackers[fid]['age_history'] else age_idx
+            age_str = AGE_RANGES[age_mode]
+            age_conf = age_probs[age_mode] * 100
+            smoothed_cont_age = int(self.trackers[fid]['cont_age']) if self.trackers[fid]['cont_age'] is not None else "?"
+            age_label = f"{age_str}  — {age_conf:.1f}% ({smoothed_cont_age} yrs est.)"
+
             self.canvas.itemconfig(self.age_label, text=f"🧠 Age: {age_label}")
             self.canvas.itemconfig(self.gender_label, text=f"👤 Gender: {gender_str}")
-            
-            self.current_gender_color = "0099ff" if gender_str == "Male" else "ff66cc"
-            color = (0, 153, 255) if gender_str == "Male" else (255, 102, 204)
-
-                        
+            emotion_str = detect_emotion(face)
+            self.canvas.itemconfig(self.emotion_label, text=f"🎭 Emotion: {emotion_str}")
 
         for fid in list(self.trackers):
             if fid not in seen_ids:
@@ -246,18 +243,16 @@ class SageUI(ParticleMixin):
                     del self.trackers[fid]
 
         cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        imgtk = ImageTk.PhotoImage(image=Image.fromarray(rgb_frame))
-        self.video_panel.imgtk = imgtk
-        self.video_panel.configure(image=imgtk)
-        # cap.release()  # Kept open for continuous feed
+        img = Image.fromarray(rgb_frame)
+        photo = ImageTk.PhotoImage(img)
+        self.video_panel.configure(image=photo)
+        self.video_panel.image = photo
         self.root.after(60, self.update_frame)
 
-# -------------------------------
-# LAUNCH
-# -------------------------------
 if __name__ == "__main__":
     root = tk.Tk()
     app = SageUI(root)
     root.mainloop()
+
+
