@@ -10,6 +10,7 @@ import math
 import pygame
 from deepface import DeepFace
 from collections import deque, Counter
+import traceback
 
 # -------------------------------
 # CONFIGURATION
@@ -25,14 +26,26 @@ T_GENDER = 1.5
 
 def detect_emotion(face_np):
     try:
-        result = DeepFace.analyze(face_np, actions=['emotion'], enforce_detection=False)
-        return result[0]['dominant_emotion']
+        result = DeepFace.analyze(
+            face_np,
+            actions=['emotion'],
+            enforce_detection=False,
+            detector_backend='opencv'
+        )
+        if isinstance(result, list):
+            emotion = result[0].get('dominant_emotion', 'Unknown')
+        elif isinstance(result, dict):
+            emotion = result.get('dominant_emotion', 'Unknown')
+        else:
+            print(f"[ERROR] Unexpected result format: {result}")
+            return "Unknown"
+        print(f"[INFO] Detected Emotion: {emotion}")
+        return emotion
     except Exception as e:
+        print(f"[ERROR] Emotion analysis failed: {e}")
+        traceback.print_exc()
         return "Unknown"
 
-# -------------------------------
-# DEVICE & MODEL SETUP
-# -------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 age_model = models.resnet18(weights=None)
@@ -95,22 +108,6 @@ class ParticleMixin:
             self.particles[i] = (p, dx, dy)
         self.root.after(50, self.animate_particles)
 
-    def animate_prediction_glow(self):
-        base_color = getattr(self, 'current_gender_color', "00ffee")
-        color = f"#{base_color}{int(self.glow_alpha):02x}"
-        try:
-            self.canvas.itemconfig(self.prediction_label, fill=color)
-        except:
-            pass
-        self.glow_alpha += 5 if self.glow_increasing else -5
-        if self.glow_alpha >= 255:
-            self.glow_alpha = 255
-            self.glow_increasing = False
-        elif self.glow_alpha <= 100:
-            self.glow_alpha = 100
-            self.glow_increasing = True
-        self.root.after(60, self.animate_prediction_glow)
-
     def animate_energy_ring(self):
         if hasattr(self, 'ring_arc'):
             self.canvas.delete(self.ring_arc)
@@ -130,8 +127,9 @@ class SageUI(ParticleMixin):
         pygame.mixer.music.play(-1)
         self.cap = cv2.VideoCapture(0)
 
-        self.canvas = tk.Canvas(self.root, width=960, height=960, bg="black", highlightthickness=0)
-        self.canvas.pack()
+        # Sage canvas
+        self.canvas = tk.Canvas(self.root, width=960, height=480, bg="black", highlightthickness=0)
+        self.canvas.pack(pady=(10, 0))
 
         self.header = self.canvas.create_text(480, 30, text="🧙‍♂️ Ask the SAGE", font=("Papyrus", 28, "bold"), fill="#00ffee")
         sage_img = Image.open("assets/sage-focus.png").resize((300, 300))
@@ -141,8 +139,21 @@ class SageUI(ParticleMixin):
         self.sage_image_item = self.canvas.create_image(480, 210, image=self.sage_photo)
         self.animate_energy_ring()
 
+        # Webcam frame with overlay labels
         self.video_panel = tk.Label(self.root, bd=0, bg="black")
-        self.video_panel.place(relx=0.5, rely=0.72, anchor='center', width=720, height=360)
+        self.video_panel.place(relx=0.5, rely=0.72, anchor='center', width=720, height=400)
+
+        self.age_label = tk.Label(self.video_panel, text="", font=("Helvetica", 14, "bold"),
+                                  fg="#00ffee", bg="#000000", anchor="w")
+        self.age_label.place(relx=0.02, rely=0.02)
+
+        self.gender_label = tk.Label(self.video_panel, text="", font=("Helvetica", 14, "bold"),
+                                     fg="#ff66cc", bg="#000000", anchor="w")
+        self.gender_label.place(relx=0.02, rely=0.10)
+
+        self.emotion_label = tk.Label(self.video_panel, text="", font=("Helvetica", 14, "bold"),
+                                      fg="#ffa500", bg="#000000", anchor="w")
+        self.emotion_label.place(relx=0.02, rely=0.18)
 
         self.trackers = {}
         self.next_face_id = 0
@@ -150,15 +161,6 @@ class SageUI(ParticleMixin):
 
         self.particles = self.create_particles(30)
         self.animate_particles()
-        self.age_label_bg = self.canvas.create_rectangle(180, 370, 780, 400, fill="#222222", outline="", stipple="gray25")
-        self.gender_label_bg = self.canvas.create_rectangle(180, 405, 780, 435, fill="#222222", outline="", stipple="gray25")
-        self.age_label = self.canvas.create_text(480, 385, text="", font=("Helvetica", 18, "bold"), fill="#00ffee")
-        self.gender_label = self.canvas.create_text(480, 420, text="", font=("Helvetica", 18, "bold"), fill="#ff66cc")
-        self.emotion_label_bg = self.canvas.create_rectangle(180, 440, 780, 470, fill="#222222", outline="", stipple="gray25")
-        self.emotion_label = self.canvas.create_text(480, 455, text="", font=("Helvetica", 18, "bold"), fill="#ffa500")
-        self.glow_alpha = 0
-        self.glow_increasing = True
-        self.animate_prediction_glow()
         self.update_frame()
 
     def update_frame(self):
@@ -216,8 +218,6 @@ class SageUI(ParticleMixin):
                     ALPHA_EMA * cont_age + (1 - ALPHA_EMA) * self.trackers[fid]['cont_age'])
             else:
                 continue
-                self.trackers[fid]['cont_age'] = cont_age if self.trackers[fid]['cont_age'] is None else (
-                    ALPHA_EMA * cont_age + (1 - ALPHA_EMA) * self.trackers[fid]['cont_age'])
 
             gender_probs = tta_predict(gender_model, pil_face, transform, GENDER_AUGS, T_GENDER)
             gender_idx = gender_probs.argmax()
@@ -225,16 +225,16 @@ class SageUI(ParticleMixin):
             gender_str = f"{GENDER_LIST[gender_idx]} — {gender_conf:.1f}%"
             self.current_gender_color = "0099ff" if gender_idx == 0 else "ff66cc"
 
-            age_mode = Counter(self.trackers[fid]['age_history']).most_common(1)[0][0] if self.trackers[fid]['age_history'] else age_idx
+            age_mode = Counter(self.trackers[fid]['age_history']).most_common(1)[0][0]
             age_str = AGE_RANGES[age_mode]
             age_conf = age_probs[age_mode] * 100
             smoothed_cont_age = int(self.trackers[fid]['cont_age']) if self.trackers[fid]['cont_age'] is not None else "?"
             age_label = f"{age_str}  — {age_conf:.1f}% ({smoothed_cont_age} yrs est.)"
 
-            self.canvas.itemconfig(self.age_label, text=f"🧠 Age: {age_label}")
-            self.canvas.itemconfig(self.gender_label, text=f"👤 Gender: {gender_str}")
+            self.age_label.config(text=f"🧠 Age: {age_label}")
+            self.gender_label.config(text=f"👤 Gender: {gender_str}")
             emotion_str = detect_emotion(face)
-            self.canvas.itemconfig(self.emotion_label, text=f"🎭 Emotion: {emotion_str}")
+            self.emotion_label.config(text=f"🎭 Emotion: {emotion_str}")
 
         for fid in list(self.trackers):
             if fid not in seen_ids:
@@ -254,5 +254,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = SageUI(root)
     root.mainloop()
-
-
